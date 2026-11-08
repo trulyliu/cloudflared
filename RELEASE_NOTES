@@ -1,4 +1,4 @@
-Unreleased
+2026.10.10
 - 2026-11-08 Stop leaking per-connection HTTP/2 shutdown waiters after edge disconnects.
 - 2026-11-08 Log HTTP/2 PING timeout causes and per-connection/supervisor retry durations.
 

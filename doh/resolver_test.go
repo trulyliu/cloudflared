@@ -42,7 +42,7 @@ func TestResolverQueriesThroughAuthenticatedProxy(t *testing.T) {
 		case "28":
 			answer = `,"Answer":[{"type":5,"data":"aaaa.alias.example."},{"type":28,"data":"2001:db8::1"}]`
 		case "16":
-			answer = `,"Answer":[{"type":5,"data":"txt.alias.example."},{"type":16,"data":"\"feature-value\""}]`
+			answer = `,"Answer":[{"type":5,"data":"txt.alias.example."},{"type":16,"data":"feature-value"}]`
 		default:
 			t.Errorf("unexpected query type %q", request.URL.Query().Get("type"))
 			w.WriteHeader(http.StatusBadRequest)
@@ -375,17 +375,17 @@ func TestLookupIPAllowsOneSuccessfulFamily(t *testing.T) {
 	assert.ElementsMatch(t, []string{"1", "28"}, requested)
 }
 
-func TestLookupTXTRejectsMalformedQuotedData(t *testing.T) {
+func TestLookupTXTReturnsDNSJSONDataUnmodified(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"Status":0,"Answer":[{"type":16,"data":"unquoted"}]}`)
+		_, _ = io.WriteString(w, `{"Status":0,"Answer":[{"type":16,"data":"unquoted"},{"type":16,"data":"\"quoted text\""}]}`)
 	}))
 	defer server.Close()
 	proxyURL, _ := startConnectProxy(t, server.Listener.Addr().String())
 	resolver, err := newResolverWithTLS(proxyURL, server.URL, server.Client().Transport.(*http.Transport).TLSClientConfig)
 	require.NoError(t, err)
-	_, err = resolver.LookupTXT(context.Background(), "features.example")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "TXT")
+	texts, err := resolver.LookupTXT(context.Background(), "features.example")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"unquoted", `"quoted text"`}, texts)
 }

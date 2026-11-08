@@ -195,11 +195,7 @@ func (r *Resolver) LookupTXT(ctx context.Context, host string) ([]string, error)
 		if answer.Type != typeTXT {
 			return nil, fmt.Errorf("malformed TXT answer for %q", host)
 		}
-		value, err := strconv.Unquote(answer.Data)
-		if err != nil {
-			return nil, fmt.Errorf("malformed TXT data for %q: %w", host, err)
-		}
-		records = append(records, value)
+		records = append(records, answer.Data)
 	}
 	return records, nil
 }

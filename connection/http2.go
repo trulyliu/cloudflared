@@ -73,6 +73,11 @@ func NewHTTP2Connection(
 			MaxConcurrentStreams: MaxConcurrentStreams, //nolint:staticcheck
 			ReadIdleTimeout:      http2ReadIdleTimeout, //nolint:staticcheck
 			PingTimeout:          http2PingTimeout,     //nolint:staticcheck
+			CountError: func(errorType string) { //nolint:staticcheck
+				if errorType == "conn_close_lost_ping" {
+					log.Warn().Uint8(LogFieldConnIndex, connIndex).Msg("HTTP/2 health-check PING timed out")
+				}
+			}, //nolint:staticcheck
 		},
 		orchestrator:         orchestrator,
 		connOptions:          connOptions,

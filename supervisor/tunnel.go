@@ -221,7 +221,15 @@ type TunnelServer interface {
 	Serve(ctx context.Context, connIndex uint8, protocolFallback *protocolFallback, connectedSignal *signal.Signal) error
 }
 
-func (e *EdgeTunnelServer) Serve(ctx context.Context, connIndex uint8, protocolFallback *protocolFallback, connectedSignal *signal.Signal) error {
+func (e *EdgeTunnelServer) Serve(ctx context.Context, connIndex uint8, protocolFallback *protocolFallback, connectedSignal *signal.Signal) (serveErr error) {
+	serveStartedAt := time.Now()
+	defer func() {
+		e.config.Log.Info().
+			Uint8(connection.LogFieldConnIndex, connIndex).
+			Dur("serveDuration", time.Since(serveStartedAt)).
+			Bool("failed", serveErr != nil).
+			Msg("Tunnel connection serve returned")
+	}()
 	haConnections.Inc()
 	defer haConnections.Dec()
 
@@ -296,15 +304,26 @@ func (e *EdgeTunnelServer) Serve(ctx context.Context, connIndex uint8, protocolF
 	if !ok {
 		return err
 	}
+	retryAttempt := protocolFallback.Retries() + 1
 	e.config.Observer.SendReconnect(connIndex)
-	connLog.Logger().Info().Msgf("Retrying connection in up to %s", duration)
+	connLog.Logger().Info().
+		Int("retryAttempt", retryAttempt).
+		Dur("maxBackoff", duration).
+		Msgf("Retrying connection in up to %s", duration)
+	retryStartedAt := time.Now()
+	retryTimer := protocolFallback.BackoffTimer()
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.gracefulShutdownC:
 		return nil
-	case <-protocolFallback.BackoffTimer():
+	case <-retryTimer:
+		connLog.Logger().Info().
+			Uint8(connection.LogFieldConnIndex, connIndex).
+			Int("retryAttempt", retryAttempt).
+			Dur("backoffWait", time.Since(retryStartedAt)).
+			Msg("Connection retry backoff elapsed")
 		// should we fallback protocol? If not, just return. Otherwise, set new protocol for next method call.
 		if !shouldFallbackProtocol {
 			return err

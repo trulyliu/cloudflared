@@ -146,6 +146,7 @@ func (s *Supervisor) Run(
 
 	backoff := retry.NewBackoff(s.config.Retries, tunnelRetryDuration, true)
 	var backoffTimer <-chan time.Time
+	var backoffTimerStartedAt time.Time
 
 	shuttingDown := false
 	for {
@@ -171,17 +172,33 @@ func (s *Supervisor) Run(
 				s.waitForNextTunnel(tunnelError.index)
 
 				if backoffTimer == nil {
+					maxBackoff, _ := backoff.GetMaxBackoffDuration(ctx)
+					backoffTimerStartedAt = time.Now()
 					backoffTimer = backoff.BackoffTimer()
+					s.log.Logger().Info().
+						Dur("maxBackoff", maxBackoff).
+						Int("retryAttempt", backoff.Retries()).
+						Int("waitingConnections", len(tunnelsWaiting)).
+						Msg("Supervisor scheduled tunnel retry backoff")
 				}
 			} else if tunnelsActive == 0 {
 				s.log.ConnAwareLogger().Msg("no more connections active and exiting")
 				// All connected tunnels exited gracefully, no more work to do
 				return nil
 			}
-		// Backoff was set and its timer expired
 		case <-backoffTimer:
 			backoffTimer = nil
+			backoffWait := time.Since(backoffTimerStartedAt)
+			backoffTimerStartedAt = time.Time{}
+			s.log.Logger().Info().
+				Dur("backoffWait", backoffWait).
+				Int("retryAttempt", backoff.Retries()).
+				Int("waitingConnections", len(tunnelsWaiting)).
+				Msg("Supervisor retry backoff elapsed")
 			for _, index := range tunnelsWaiting {
+				s.log.Logger().Info().
+					Int(connection.LogFieldConnIndex, index).
+					Msg("Starting tunnel retry")
 				go s.startTunnel(ctx, index, s.newConnectedTunnelSignal(index))
 			}
 			tunnelsActive += len(tunnelsWaiting)

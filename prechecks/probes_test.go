@@ -536,3 +536,19 @@ func TestResolveStaticEdge_PartiallyValid(t *testing.T) {
 	assert.Equal(t, Pass, targets[2].DNSResult.ProbeStatus)
 	assert.NotEmpty(t, targets[2].Addrs)
 }
+
+func TestNetManagementDialerDialsDirectWithoutProxy(t *testing.T) {
+	t.Parallel()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	dialer := &NetManagementDialer{Dialer: net.Dialer{}}
+	conn, err := dialer.DialContext(t.Context(), "tcp", listener.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	accepted, err := listener.Accept()
+	require.NoError(t, err)
+	defer func() { _ = accepted.Close() }()
+}

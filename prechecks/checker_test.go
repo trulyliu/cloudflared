@@ -239,13 +239,17 @@ func TestRunHTTP2OnlyStaticEdgeUsesInjectedResolver(t *testing.T) {
 
 func TestRunHTTP2OnlyProbesThroughProxyAndNeverCallsQUIC(t *testing.T) {
 	t.Parallel()
-	connectTargets := make(chan string, 4)
+	connectTargets := make(chan string, 8)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodConnect {
 			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
 			return
 		}
 		connectTargets <- request.Host
+		if request.Host == targetAPI {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	defer proxy.Close()
@@ -254,8 +258,7 @@ func TestRunHTTP2OnlyProbesThroughProxyAndNeverCallsQUIC(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	quic := mocks.NewMockQUICDialer(ctrl)
-	management := mocks.NewMockManagementDialer(ctrl)
-	management.EXPECT().DialContext(gomock.Any(), "tcp", targetAPI).Return(nopConn{}, nil)
+	management := &NetManagementDialer{Dialer: net.Dialer{}, ProxyURL: proxyURL}
 	report := Run(t.Context(), emptyCert, Config{
 		Timeout: 500 * time.Millisecond, IPVersion: allregions.IPv4Only, HTTP2Only: true,
 		EdgeAddrs: []string{"127.0.0.1:7844"}, ProtocolOverride: connection.HTTP2.String(),
@@ -265,11 +268,15 @@ func TestRunHTTP2OnlyProbesThroughProxyAndNeverCallsQUIC(t *testing.T) {
 	requireStatuses(t, report, Pass, Skip, Fail, Pass)
 	assert.Equal(t, detailsQUICSkippedByPolicy, report.Results[1].Details)
 	assert.True(t, report.hasHardFail())
-	select {
-	case target := <-connectTargets:
-		assert.Equal(t, "127.0.0.1:7844", target)
-	default:
-		t.Fatal("HTTP/2 precheck did not send CONNECT through the configured proxy")
+	var gotTargets []string
+	for {
+		select {
+		case target := <-connectTargets:
+			gotTargets = append(gotTargets, target)
+		default:
+			assert.ElementsMatch(t, []string{"127.0.0.1:7844", targetAPI}, gotTargets)
+			return
+		}
 	}
 }
 

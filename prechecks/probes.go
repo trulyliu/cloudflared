@@ -116,10 +116,18 @@ func (d *EdgeQUICDialer) DialQuic(
 }
 
 type NetManagementDialer struct {
-	Dialer net.Dialer
+	Dialer   net.Dialer
+	ProxyURL *url.URL
 }
 
 func (d *NetManagementDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if d.ProxyURL != nil {
+		if network != "tcp" && network != "tcp4" && network != "tcp6" {
+			return nil, fmt.Errorf("management proxy only supports TCP dials")
+		}
+		return edgedial.DialTCPViaProxy(ctx, perProbeDialTimeout, addr, nil, d.ProxyURL)
+	}
+
 	return d.Dialer.DialContext(ctx, network, addr)
 }
 

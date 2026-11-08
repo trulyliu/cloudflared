@@ -63,11 +63,27 @@ func DialEdgeViaProxy(
 	localIP net.IP,
 	proxyURL *url.URL,
 ) (net.Conn, error) {
+	if edgeTCPAddr == nil || edgeTCPAddr.IP.To16() == nil || edgeTCPAddr.Port < 1 || edgeTCPAddr.Port > 65535 {
+		return nil, newDialError(fmt.Errorf("invalid edge TCP address"), "proxy CONNECT target error")
+	}
+	if tlsConfig == nil {
+		return nil, newDialError(fmt.Errorf("TLS configuration is required"), "TLS configuration error")
+	}
+	destination := net.JoinHostPort(edgeTCPAddr.IP.String(), strconv.Itoa(edgeTCPAddr.Port))
+	return dialViaProxy(ctx, timeout, destination, localIP, proxyURL, tlsConfig)
+}
+
+// DialTCPViaProxy opens a raw TCP tunnel to destination through an HTTP CONNECT proxy.
+func DialTCPViaProxy(ctx context.Context, timeout time.Duration, destination string, localIP net.IP, proxyURL *url.URL) (net.Conn, error) {
+	return dialViaProxy(ctx, timeout, destination, localIP, proxyURL, nil)
+}
+
+func dialViaProxy(ctx context.Context, timeout time.Duration, destination string, localIP net.IP, proxyURL *url.URL, tlsConfig *tls.Config) (net.Conn, error) {
 	if proxyURL == nil || !strings.EqualFold(proxyURL.Scheme, "http") || proxyURL.Host == "" {
 		return nil, newDialError(fmt.Errorf("a valid HTTP proxy is required"), "proxy configuration error")
 	}
-	if edgeTCPAddr == nil || edgeTCPAddr.IP.To16() == nil || edgeTCPAddr.Port < 1 || edgeTCPAddr.Port > 65535 {
-		return nil, newDialError(fmt.Errorf("invalid edge TCP address"), "proxy CONNECT target error")
+	if err := validateConnectDestination(destination); err != nil {
+		return nil, newDialError(err, "proxy CONNECT target error")
 	}
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
@@ -97,7 +113,6 @@ func DialEdgeViaProxy(
 	})
 	defer stopCancellation()
 
-	destination := net.JoinHostPort(edgeTCPAddr.IP.String(), strconv.Itoa(edgeTCPAddr.Port))
 	if _, err := fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", destination, destination); err != nil {
 		return nil, newDialError(err, "write proxy CONNECT request error")
 	}
@@ -125,20 +140,39 @@ func DialEdgeViaProxy(
 		return nil, newDialError(fmt.Errorf("proxy CONNECT returned HTTP status %d", response.StatusCode), "proxy CONNECT error")
 	}
 
-	tlsConn := tls.Client(&bufferedConn{Conn: proxyConn, reader: reader}, tlsConfig)
-	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
-		return nil, newDialError(err, "TLS handshake with edge through proxy error")
+	tunnelConn := net.Conn(&bufferedConn{Conn: proxyConn, reader: reader})
+	if tlsConfig != nil {
+		tlsConn := tls.Client(tunnelConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+			return nil, newDialError(err, "TLS handshake with edge through proxy error")
+		}
+		tunnelConn = tlsConn
 	}
 	if !stopCancellation() || dialCtx.Err() != nil {
 		if err := dialCtx.Err(); err != nil {
-			return nil, newDialError(err, "edge dial canceled")
+			return nil, newDialError(err, "proxy tunnel canceled")
 		}
 	}
 	if err := proxyConn.SetDeadline(time.Time{}); err != nil {
 		return nil, newDialError(err, "clear proxy connection deadline error")
 	}
 	connected = true
-	return tlsConn, nil
+	return tunnelConn, nil
+}
+
+func validateConnectDestination(destination string) error {
+	if strings.ContainsAny(destination, "\r\n\t /\\") {
+		return fmt.Errorf("invalid CONNECT destination")
+	}
+	host, port, err := net.SplitHostPort(destination)
+	if err != nil || host == "" {
+		return fmt.Errorf("invalid CONNECT destination")
+	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		return fmt.Errorf("invalid CONNECT destination port")
+	}
+	return nil
 }
 
 type bufferedConn struct {

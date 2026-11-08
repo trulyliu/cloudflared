@@ -25,7 +25,7 @@ When enabled, cloudflared:
 
 - Sends selected startup DNS lookups, including feature TXT lookups, to `https://dns.google/resolve` through the proxy.
 - Resolves edge addresses through the same DoH resolver and connects to edge TCP addresses using HTTP CONNECT through the proxy.
-- Forces the tunnel transport to HTTP/2, even if `--protocol quic` is supplied. Startup prechecks skip QUIC and probe HTTP/2 through the proxy. The separate `api.cloudflare.com:443` management probe remains direct.
+- Forces the tunnel transport to HTTP/2, even if `--protocol quic` is supplied. Startup prechecks skip QUIC and probe HTTP/2 through the proxy. The `api.cloudflare.com:443` management TCP probe also uses CONNECT through the proxy, so the proxy resolves that hostname instead of the local system resolver. With SAND egress disabled, this probe remains direct.
 
 A hostname-valued proxy must be resolved before the proxy can be reached; that bootstrap lookup uses the OS resolver. Use a literal proxy IP to avoid it. Missing or malformed proxy configuration is a startup error when SAND egress is enabled. The enable variable must equal exactly `1`.
 

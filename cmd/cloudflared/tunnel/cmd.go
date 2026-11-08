@@ -570,10 +570,11 @@ func runPrechecks(c *cli.Context, log *zerolog.Logger, tunnelConfig *supervisor.
 	}
 
 	dialers := prechecks.RunDialers{
-		DNSResolver:      &prechecks.EdgeDNSResolver{Log: log, Resolver: tunnelConfig.EdgeDNSResolver},
-		TCPDialer:        &prechecks.EdgeTCPDialer{ProxyURL: tunnelConfig.EgressProxyURL},
-		QUICDialer:       &prechecks.EdgeQUICDialer{},
-		ManagementDialer: &prechecks.NetManagementDialer{Dialer: net.Dialer{}},
+		DNSResolver: &prechecks.EdgeDNSResolver{Log: log, Resolver: tunnelConfig.EdgeDNSResolver},
+		TCPDialer:   &prechecks.EdgeTCPDialer{ProxyURL: tunnelConfig.EgressProxyURL},
+		QUICDialer:  &prechecks.EdgeQUICDialer{},
+		// In SAND mode the proxy resolves the management API hostname itself.
+		ManagementDialer: &prechecks.NetManagementDialer{Dialer: net.Dialer{}, ProxyURL: tunnelConfig.EgressProxyURL},
 	}
 
 	pqMode := tunnelConfig.ClientConfig.ConnectionFeaturesSnapshot().PostQuantum

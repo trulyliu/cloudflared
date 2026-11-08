@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
@@ -29,6 +30,11 @@ const (
 	WebsocketUpgrade          = "websocket"
 	ControlStreamUpgrade      = "control-stream"
 	ConfigurationUpdate       = "update-configuration"
+)
+
+const (
+	http2ReadIdleTimeout = 30 * time.Second
+	http2PingTimeout     = 15 * time.Second
 )
 
 var errEdgeConnectionClosed = fmt.Errorf("connection with edge closed")
@@ -63,10 +69,10 @@ func NewHTTP2Connection(
 	return &HTTP2Connection{
 		conn: conn,
 		server: &http2.Server{ //nolint:staticcheck
-			// In case more values are set it is imperative to update
-			// the test TestHTTP2MaxConcurrentStreams expecting the
-			// new values
+			// Keep HTTP/2 tunnels alive through idle middleboxes and detect silent edge loss.
 			MaxConcurrentStreams: MaxConcurrentStreams, //nolint:staticcheck
+			ReadIdleTimeout:      http2ReadIdleTimeout, //nolint:staticcheck
+			PingTimeout:          http2PingTimeout,     //nolint:staticcheck
 		},
 		orchestrator:         orchestrator,
 		connOptions:          connOptions,

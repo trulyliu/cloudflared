@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 
 	"github.com/cloudflare/cloudflared/client"
 	"github.com/cloudflare/cloudflared/tracing"
@@ -65,6 +66,79 @@ func newTestHTTP2Connection() (*HTTP2Connection, net.Conn) {
 		controlStream,
 		&log,
 	), edgeConn
+}
+
+func TestHTTP2ConnectionDetectsUnresponsiveEdge(t *testing.T) {
+	t.Parallel()
+
+	http2Conn, edgeConn := newTestHTTP2Connection()
+	defer func() { _ = edgeConn.Close() }()
+	require.Equal(t, http2ReadIdleTimeout, http2Conn.server.ReadIdleTimeout) //nolint:staticcheck
+	require.Equal(t, http2PingTimeout, http2Conn.server.PingTimeout)         //nolint:staticcheck
+	// Keep this behavior test fast while exercising the production ServeConn path.
+	http2Conn.server.ReadIdleTimeout = 20 * time.Millisecond //nolint:staticcheck
+	http2Conn.server.PingTimeout = 20 * time.Millisecond     //nolint:staticcheck
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- http2Conn.Serve(ctx)
+	}()
+
+	pingSeen := make(chan struct{}, 1)
+	clientDone := make(chan error, 1)
+	go func() {
+		if _, err := io.WriteString(edgeConn, http2.ClientPreface); err != nil {
+			clientDone <- err
+			return
+		}
+		framer := http2.NewFramer(edgeConn, edgeConn)
+		if err := framer.WriteSettings(); err != nil {
+			clientDone <- err
+			return
+		}
+		for {
+			frame, err := framer.ReadFrame()
+			if err != nil {
+				clientDone <- err
+				return
+			}
+			if settings, ok := frame.(*http2.SettingsFrame); ok && !settings.IsAck() {
+				if err := framer.WriteSettingsAck(); err != nil {
+					clientDone <- err
+					return
+				}
+			}
+			if ping, ok := frame.(*http2.PingFrame); ok && !ping.IsAck() {
+				select {
+				case pingSeen <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-pingSeen:
+	case err := <-clientDone:
+		t.Fatalf("edge client failed before receiving health-check PING: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("HTTP/2 server did not send an idle health-check PING")
+	}
+	select {
+	case err := <-serveDone:
+		require.ErrorIs(t, err, errEdgeConnectionClosed)
+	case <-time.After(time.Second):
+		t.Fatal("HTTP/2 server did not close after an unanswered PING")
+	}
+	_ = edgeConn.Close()
+	select {
+	case err := <-clientDone:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("edge frame reader did not stop after the server closed")
+	}
 }
 
 func TestHTTP2ConfigurationSet(t *testing.T) {

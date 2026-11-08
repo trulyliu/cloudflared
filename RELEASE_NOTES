@@ -1,7 +1,5 @@
-Unreleased
-- Route the `api.cloudflare.com:443` startup precheck through the configured SAND HTTP proxy, avoiding local system DNS for that destination.
-
 2026.10.8
+- 2026-11-08 Route the `api.cloudflare.com:443` startup precheck through the configured SAND HTTP proxy, avoiding local system DNS for that destination.
 - 2026-11-08 Add opt-in SAND egress proxy mode using `SAND_EGRESS_TUNNEL_ENABLED=1` and `SAND_EGRESS_TUNNEL_PROXY_ADDR`; startup Google DoH lookups and HTTP/2 edge connections use the configured HTTP proxy.
 - 2026-11-08 Proxy URL userinfo uses Basic authentication over plaintext HTTP; only configure credentials across a trusted client-to-proxy network.
 - 2026-11-08 Add `cloudflared tunnel run --dns-proxy [LOOPBACK_IP]` to forward UDP/53 queries through Google DoH; defaults to `127.0.0.1` and uses the configured SAND HTTP proxy when enabled.

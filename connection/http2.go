@@ -85,10 +85,8 @@ func NewHTTP2Connection(
 
 // Serve serves an HTTP2 server that the edge can talk to.
 func (c *HTTP2Connection) Serve(ctx context.Context) error {
-	go func() {
-		<-ctx.Done()
-		c.close()
-	}()
+	stopClose := context.AfterFunc(ctx, c.close)
+	defer stopClose()
 	c.server.ServeConn(c.conn, &http2.ServeConnOpts{ //nolint: staticcheck
 		Context: ctx,
 		Handler: c,

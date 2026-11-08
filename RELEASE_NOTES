@@ -1,4 +1,4 @@
-Unreleased
+2026.10.9
 - 2026-11-08 Add HTTP/2 PING health checks to detect and reconnect silent edge disconnects.
 
 2026.10.8

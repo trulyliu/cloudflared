@@ -55,8 +55,8 @@ func (tr TransportResults) Collect() []CheckResult {
 //  1. Edge address resolution — either DNS-based SRV discovery (normal path)
 //     or direct resolution of --edge addresses (static path). The static path
 //     skips DNS probe rows entirely since there are no SRV records to validate.
-//  2. QUIC, HTTP/2, and Management API probes run concurrently against the
-//     resolved addresses.
+//  2. HTTP/2 and Management API probes run concurrently against the resolved addresses.
+//     QUIC is probed only when HTTP2Only is false; otherwise one QUIC SKIP row is emitted per target.
 //
 // Each failed probe is retried up to maxRetries times with exponential backoff.
 // The suite is bounded by cfg.Timeout (defaultTimeout if zero).
@@ -77,15 +77,18 @@ func Run(ctx context.Context, caCert string, cfg Config, pqMode features.PostQua
 	quicTLSConfig, quicTLSErr := probeTLSConfig(caCert, connection.QUIC, pqMode)
 	http2TLSConfig, http2TLSErr := probeTLSConfig(caCert, connection.HTTP2, pqMode)
 
-	// 1) Resolve edge addresses. Each ResolvedTarget bundles its addr group
-	//    with the DNS CheckResult that labels it, keeping the two in sync.
+	// Resolve custom and dynamic edge addresses with the configured DoH resolver when present.
+	dnsResolver := runDialers.DNSResolver
+	var edgeResolver allregions.DNSResolver
+	if cfg.EdgeResolver != nil {
+		edgeResolver = allregions.ContextualResolver(ctx, cfg.EdgeResolver)
+		dnsResolver = &EdgeDNSResolver{Log: log, Resolver: edgeResolver}
+	}
 	var resolvedTargets []ResolvedTarget
 	if len(cfg.EdgeAddrs) > 0 {
-		// Static path: explicit --edge addresses, one ResolvedTarget per addr.
-		resolvedTargets = resolveStaticEdge(cfg.EdgeAddrs, log)
+		resolvedTargets = resolveStaticEdgeWithResolver(cfg.EdgeAddrs, log, edgeResolver)
 	} else {
-		// Normal path: SRV-based discovery; DNS rows carry Pass or Fail status.
-		resolvedTargets = runDNSProbe(ctx, runDialers.DNSResolver, cfg.Region)
+		resolvedTargets = runDNSProbe(ctx, dnsResolver, cfg.Region)
 	}
 
 	// Extract parallel slices for the transport probe layer.
@@ -114,30 +117,31 @@ func Run(ctx context.Context, caCert string, cfg Config, pqMode features.PostQua
 	}()
 
 	if !dnsOK {
-		// No addresses available: emit one skip row per target so the table
-		// stays consistent with the DNS rows above.
 		results.QUIC = skipResultsForTargets(dnsResults, ProbeTypeQUIC, componentUDPConnectivity)
 		results.HTTP2 = skipResultsForTargets(dnsResults, ProbeTypeHTTP2, componentTCPConnectivity)
 	} else {
 		filteredAddrs := addrsByGroup(perGroupAddrs, cfg.IPVersion)
+		var quicCh chan []CheckResult
+		if cfg.HTTP2Only {
+			results.QUIC = skipResultsForTargetsWithDetails(dnsResults, ProbeTypeQUIC, componentUDPConnectivity, detailsQUICSkippedByPolicy)
+		} else {
+			quicCh = make(chan []CheckResult, 1)
+			go func() {
+				if quicTLSErr != nil {
+					log.Warn().Err(quicTLSErr).Msg("Failed to build QUIC probe TLS config")
+					quicCh <- tlsConfigErrResults(ProbeTypeQUIC, componentUDPConnectivity,
+						targetLabels, fmt.Sprintf("%s: %v", detailsTLSConfigFailed, quicTLSErr), actionQUICBlocked)
+					return
+				}
+				quicCh <- probeAllTargets(ctx, ProbeTypeQUIC, componentUDPConnectivity,
+					filteredAddrs, targetLabels,
+					func(addr *allregions.EdgeAddr) CheckResult {
+						return probeQUIC(ctx, quicTLSConfig, runDialers.QUICDialer, addr, log, cfg)
+					})
+			}()
+		}
 
-		quicCh := make(chan []CheckResult, 1)
 		http2Ch := make(chan []CheckResult, 1)
-
-		go func() {
-			if quicTLSErr != nil {
-				log.Warn().Err(quicTLSErr).Msg("Failed to build QUIC probe TLS config")
-				quicCh <- tlsConfigErrResults(ProbeTypeQUIC, componentUDPConnectivity,
-					targetLabels, fmt.Sprintf("%s: %v", detailsTLSConfigFailed, quicTLSErr), actionQUICBlocked)
-				return
-			}
-			quicCh <- probeAllTargets(ctx, ProbeTypeQUIC, componentUDPConnectivity,
-				filteredAddrs, targetLabels,
-				func(addr *allregions.EdgeAddr) CheckResult {
-					return probeQUIC(ctx, quicTLSConfig, runDialers.QUICDialer, addr, log, cfg)
-				})
-		}()
-
 		go func() {
 			if http2TLSErr != nil {
 				log.Warn().Err(http2TLSErr).Msg("Failed to build HTTP/2 probe TLS config")
@@ -151,8 +155,9 @@ func Run(ctx context.Context, caCert string, cfg Config, pqMode features.PostQua
 					return probeHTTP2(ctx, http2TLSConfig, runDialers.TCPDialer, addr, cfg.EdgeBindAddr)
 				})
 		}()
-
-		results.QUIC = <-quicCh
+		if quicCh != nil {
+			results.QUIC = <-quicCh
+		}
 		results.HTTP2 = <-http2Ch
 	}
 
@@ -274,9 +279,13 @@ func addrsByGroup(addrGroups [][]*allregions.EdgeAddr, ipVersion allregions.Conf
 // skipResultsForTargets returns one skip CheckResult per entry in results,
 // using each entry's Target label so the transport row aligns with its DNS row.
 func skipResultsForTargets(targets []CheckResult, probeType ProbeType, component string) []CheckResult {
+	return skipResultsForTargetsWithDetails(targets, probeType, component, detailsDNSPrerequisiteFailed)
+}
+
+func skipResultsForTargetsWithDetails(targets []CheckResult, probeType ProbeType, component, details string) []CheckResult {
 	results := make([]CheckResult, len(targets))
-	for i, t := range targets {
-		results[i] = skipResult(probeType, component, t.Target, detailsDNSPrerequisiteFailed)
+	for i, target := range targets {
+		results[i] = skipResult(probeType, component, target.Target, details)
 	}
 	return results
 }

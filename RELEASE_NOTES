@@ -1,3 +1,8 @@
+Unreleased
+- Add opt-in SAND egress proxy mode using `SAND_EGRESS_TUNNEL_ENABLED=1` and `SAND_EGRESS_TUNNEL_PROXY_ADDR`; startup Google DoH lookups and HTTP/2 edge connections use the configured HTTP proxy.
+- Proxy URL userinfo uses Basic authentication over plaintext HTTP; only configure credentials across a trusted client-to-proxy network.
+- Add `cloudflared tunnel run --dns-proxy [LOOPBACK_IP]` to forward UDP/53 queries through Google DoH; defaults to `127.0.0.1` and uses the configured SAND HTTP proxy when enabled.
+
 2026.10.7
 - 2026-10-30 TUN-11058: Fix regression on max concurrent streams over http2 introduced by go1.27
 - 2026-10-29 TUN-10904: Stop advertising legacy default features to the edge

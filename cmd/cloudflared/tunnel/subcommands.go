@@ -727,6 +727,7 @@ func buildRunCommand() *cli.Command {
 		dnsResolverAddrsFlag,
 	}
 	cliFlags = append(cliFlags, configureProxyFlags(false)...)
+	cliFlags = append(cliFlags, configureDNSProxyFlag(false))
 	return &cli.Command{
 		Name:      "run",
 		Action:    cliutil.ConfiguredAction(runCommand),

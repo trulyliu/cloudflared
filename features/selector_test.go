@@ -139,6 +139,44 @@ func TestDeprecatedFeaturesRemoved(t *testing.T) {
 	require.Empty(t, snapshot.FeaturesList)
 }
 
+func TestFeatureSelectorWithTXTResolver(t *testing.T) {
+	t.Parallel()
+	logger := zerolog.Nop()
+	resolver := &testTXTLookup{records: []string{`{"dv3_2":100}`, "ignored"}}
+	selector, err := NewFeatureSelectorWithResolver(t.Context(), testAccountTag, nil, false, &logger, resolver)
+	require.NoError(t, err)
+	require.Equal(t, 1, resolver.calls)
+	require.Equal(t, featureSelectorHostname, resolver.host)
+	featureSelector := selector.(*featureSelector)
+	require.NoError(t, featureSelector.refresh(t.Context()))
+	require.Equal(t, 2, resolver.calls)
+	require.Equal(t, DatagramV3, selector.Snapshot().DatagramVersion)
+}
+
+func TestFeatureSelectorWithTXTResolverFailureUsesDefaults(t *testing.T) {
+	t.Parallel()
+	logger := zerolog.Nop()
+	resolver := &testTXTLookup{err: fmt.Errorf("TXT lookup failed")}
+	selector, err := NewFeatureSelectorWithResolver(t.Context(), testAccountTag, nil, false, &logger, resolver)
+	require.NoError(t, err)
+	require.NotNil(t, selector)
+	require.Equal(t, 1, resolver.calls)
+	require.Equal(t, DatagramV2, selector.Snapshot().DatagramVersion)
+}
+
+type testTXTLookup struct {
+	records []string
+	err     error
+	calls   int
+	host    string
+}
+
+func (r *testTXTLookup) LookupTXT(ctx context.Context, host string) ([]string, error) {
+	r.calls++
+	r.host = host
+	return r.records, r.err
+}
+
 func TestRefreshFeaturesRecord(t *testing.T) {
 	percentages := []uint32{0, 10, testAccountHash - 1, testAccountHash, testAccountHash + 1, 100, 101, 1000}
 	selector := newTestSelector(t, percentages, false, time.Minute)

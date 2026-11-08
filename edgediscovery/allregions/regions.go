@@ -21,6 +21,16 @@ type Regions struct {
 // ResolveEdge resolves the Cloudflare edge, returning all regions discovered.
 func ResolveEdge(log *zerolog.Logger, region string, overrideIPVersion ConfigIPVersion) (*Regions, error) {
 	edgeAddrs, err := EdgeDiscovery(log, RegionalServiceName(region))
+	return regionsFromEdgeAddrs(edgeAddrs, overrideIPVersion, err)
+}
+
+// ResolveEdgeWithResolver resolves the Cloudflare edge using only the supplied DNS resolver.
+func ResolveEdgeWithResolver(log *zerolog.Logger, region string, overrideIPVersion ConfigIPVersion, resolver DNSResolver) (*Regions, error) {
+	edgeAddrs, err := EdgeDiscoveryWithResolver(log, RegionalServiceName(region), resolver)
+	return regionsFromEdgeAddrs(edgeAddrs, overrideIPVersion, err)
+}
+
+func regionsFromEdgeAddrs(edgeAddrs [][]*EdgeAddr, overrideIPVersion ConfigIPVersion, err error) (*Regions, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -37,6 +47,15 @@ func ResolveEdge(log *zerolog.Logger, region string, overrideIPVersion ConfigIPV
 // Mainly used for testing connectivity.
 func StaticEdge(hostnames []string, log *zerolog.Logger) (*Regions, error) {
 	resolved := ResolveAddrs(hostnames, log)
+	if len(resolved) == 0 {
+		return nil, fmt.Errorf("failed to resolve any edge address")
+	}
+	return NewNoResolve(resolved), nil
+}
+
+// StaticEdgeWithResolver resolves custom edge addresses using only the supplied resolver.
+func StaticEdgeWithResolver(hostnames []string, log *zerolog.Logger, resolver DNSResolver) (*Regions, error) {
+	resolved := ResolveAddrsWithResolver(hostnames, log, resolver)
 	if len(resolved) == 0 {
 		return nil, fmt.Errorf("failed to resolve any edge address")
 	}

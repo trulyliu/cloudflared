@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -50,7 +52,9 @@ var (
 
 func main() {
 	// FIXME: TUN-8148: Disable QUIC_GO ECN due to bugs in proper detection if supported
-	os.Setenv("QUIC_GO_DISABLE_ECN", "1")
+	if err := os.Setenv("QUIC_GO_DISABLE_ECN", "1"); err != nil {
+		panic(err)
+	}
 	metrics.RegisterBuildInfo(BuildType, BuildTime, Version)
 	_, _ = maxprocs.Set()
 	bInfo := cliutil.GetBuildInfo(BuildType, Version)
@@ -93,11 +97,39 @@ func main() {
 	token.Init(Version)
 	tail.Init(bInfo)
 	management.Init(bInfo)
+	os.Args = normalizeDNSProxyArgs(os.Args)
 	runApp(app, graceShutdownC)
 }
 
+func normalizeDNSProxyArgs(args []string) []string {
+	normalized := slices.Clone(args)
+	for i := 1; i < len(normalized); i++ {
+		if normalized[i] == "--" {
+			break
+		}
+		if normalized[i] != "--"+cfdflags.DNSProxy {
+			continue
+		}
+		if i+1 < len(normalized) && isIPAddress(normalized[i+1]) {
+			continue
+		}
+		normalized[i] += "=" + cfdflags.DNSProxyDefaultAddress
+	}
+	return normalized
+}
+
+func isIPAddress(value string) bool {
+	if len(value) > 2 && value[0] == '[' && value[len(value)-1] == ']' {
+		value = value[1 : len(value)-1]
+	}
+	return net.ParseIP(value) != nil
+}
+
 func commands(version func(c *cli.Context)) []*cli.Command {
-	cmds := []*cli.Command{
+	tunnelCommands := tunnel.Commands()
+	accessCommands := access.Commands()
+	cmds := make([]*cli.Command, 0, 2+len(tunnelCommands)+1+len(accessCommands)+1+1)
+	cmds = append(cmds, []*cli.Command{
 		{
 			Name:   "update",
 			Action: cliutil.ConfiguredAction(updater.Update),
@@ -149,10 +181,10 @@ To determine if an update happened in a script, check for error code 11.`,
 				},
 			},
 		},
-	}
-	cmds = append(cmds, tunnel.Commands()...)
+	}...)
+	cmds = append(cmds, tunnelCommands...)
 	cmds = append(cmds, proxydns.Command()) // removed feature, only here for error message
-	cmds = append(cmds, access.Commands()...)
+	cmds = append(cmds, accessCommands...)
 	cmds = append(cmds, tail.Command())
 	cmds = append(cmds, management.Command())
 	return cmds

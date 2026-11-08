@@ -407,6 +407,20 @@ func TestHasHardFail(t *testing.T) {
 	assert.True(t, dnsFailReport().hasHardFail())
 }
 
+func TestHasHardFailWhenOnlyAvailableTransportFails(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, Report{Results: []CheckResult{
+		{Type: ProbeTypeQUIC, ProbeStatus: Skip},
+		{Type: ProbeTypeHTTP2, ProbeStatus: Fail},
+	}}.hasHardFail())
+	assert.False(t, Report{Results: []CheckResult{
+		{Type: ProbeTypeQUIC, ProbeStatus: Pass},
+		{Type: ProbeTypeQUIC, ProbeStatus: Skip},
+		{Type: ProbeTypeHTTP2, ProbeStatus: Fail},
+	}}.hasHardFail())
+}
+
 func TestHasWarn(t *testing.T) {
 	t.Parallel()
 	assert.False(t, allPassReport().hasWarn())

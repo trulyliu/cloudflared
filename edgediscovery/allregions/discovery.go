@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -33,6 +34,30 @@ var (
 	netLookupSRV = net.LookupSRV
 	netLookupIP  = net.LookupIP
 )
+
+// DNSResolver provides the DNS lookups required for edge discovery.
+type DNSResolver interface {
+	LookupSRV(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)
+	LookupIP(ctx context.Context, host string) ([]net.IP, error)
+}
+
+// ContextualResolver binds resolver lookups to ctx for discovery APIs without a context parameter.
+func ContextualResolver(ctx context.Context, resolver DNSResolver) DNSResolver {
+	return contextBoundResolver{ctx: ctx, resolver: resolver}
+}
+
+type contextBoundResolver struct {
+	ctx      context.Context
+	resolver DNSResolver
+}
+
+func (r contextBoundResolver) LookupSRV(_ context.Context, service, proto, name string) (string, []*net.SRV, error) {
+	return r.resolver.LookupSRV(r.ctx, service, proto, name)
+}
+
+func (r contextBoundResolver) LookupIP(_ context.Context, host string) ([]net.IP, error) {
+	return r.resolver.LookupIP(r.ctx, host)
+}
 
 // ConfigIPVersion is the selection of IP versions from config
 type ConfigIPVersion int8
@@ -148,6 +173,134 @@ func EdgeDiscovery(log *zerolog.Logger, srvService string) ([][]*EdgeAddr, error
 	}
 
 	return resolvedAddrPerCNAME, nil
+}
+
+// EdgeDiscoveryWithResolver discovers edge addresses using only the supplied resolver.
+// Unlike EdgeDiscovery, it never falls back to the system resolver or DoT.
+func EdgeDiscoveryWithResolver(log *zerolog.Logger, srvService string, resolver DNSResolver) ([][]*EdgeAddr, error) {
+	if resolver == nil {
+		return nil, fmt.Errorf("edge discovery requires an injected DNS resolver")
+	}
+	logger := log.With().Int(management.EventTypeKey, int(management.Cloudflared)).Logger()
+	logger.Debug().
+		Int(management.EventTypeKey, int(management.Cloudflared)).
+		Str("domain", "_"+srvService+"._"+srvProto+"."+srvName).
+		Msg("edge discovery: looking up edge SRV record")
+
+	_, addrs, err := resolver.LookupSRV(context.Background(), srvService, srvProto, srvName)
+	if err != nil {
+		logger.Err(err).Msg("edge discovery: injected DNS resolver failed to look up Cloudflare edge SRV records")
+		return nil, errors.Wrap(err, "failed to look up Cloudflare edge SRV records")
+	}
+
+	resolvedAddrPerCNAME := make([][]*EdgeAddr, 0, len(addrs))
+	for _, addr := range addrs {
+		edgeAddrs, err := resolveSRVWithResolver(context.Background(), resolver, addr)
+		if err != nil {
+			return nil, err
+		}
+		logAddrs := make([]string, len(edgeAddrs))
+		for i, edgeAddr := range edgeAddrs {
+			logAddrs[i] = edgeAddr.UDP.IP.String()
+		}
+		logger.Debug().Strs("addresses", logAddrs).Msg("edge discovery: resolved edge addresses")
+		resolvedAddrPerCNAME = append(resolvedAddrPerCNAME, edgeAddrs)
+	}
+	return resolvedAddrPerCNAME, nil
+}
+
+func resolveSRVWithResolver(ctx context.Context, resolver DNSResolver, srv *net.SRV) ([]*EdgeAddr, error) {
+	if srv == nil || srv.Target == "" {
+		return nil, fmt.Errorf("edge SRV record has no target")
+	}
+	ips, err := resolver.LookupIP(ctx, srv.Target)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to resolve IP addresses for an edge SRV target")
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("edge SRV target resolved to no IP addresses")
+	}
+	addrs := make([]*EdgeAddr, len(ips))
+	for i, ip := range ips {
+		if ip == nil {
+			return nil, fmt.Errorf("edge SRV target returned an invalid IP address")
+		}
+		version := V6
+		if ip.To4() != nil {
+			version = V4
+		}
+		addrs[i] = &EdgeAddr{
+			TCP:       &net.TCPAddr{IP: ip, Port: int(srv.Port)},
+			UDP:       &net.UDPAddr{IP: ip, Port: int(srv.Port)},
+			IPVersion: version,
+		}
+	}
+	return addrs, nil
+}
+
+// ResolveAddrsWithResolver resolves custom edge addresses using the supplied resolver for hostnames.
+// Literal IP addresses are parsed locally and do not trigger a DNS lookup.
+func ResolveAddrsWithResolver(addrs []string, log *zerolog.Logger, resolver DNSResolver) (resolved []*EdgeAddr) {
+	for _, addr := range addrs {
+		host, portText, err := net.SplitHostPort(addr)
+		if err != nil {
+			log.Error().Int(management.EventTypeKey, int(management.Cloudflared)).
+				Str(logFieldAddress, addr).Err(err).Msg("edge discovery: failed to resolve to TCP address")
+			continue
+		}
+		if host == "" {
+			log.Error().Int(management.EventTypeKey, int(management.Cloudflared)).
+				Str(logFieldAddress, addr).Err(fmt.Errorf("address host is empty")).Msg("edge discovery: failed to resolve to TCP address")
+			continue
+		}
+		port, err := net.LookupPort("tcp", portText)
+		if err != nil {
+			log.Error().Int(management.EventTypeKey, int(management.Cloudflared)).
+				Str(logFieldAddress, addr).Err(err).Msg("edge discovery: failed to resolve to TCP address")
+			continue
+		}
+
+		var ip net.IP
+		var zone string
+		if zoneIndex := strings.LastIndexByte(host, '%'); zoneIndex >= 0 {
+			if scopedIP := net.ParseIP(host[:zoneIndex]); scopedIP != nil {
+				ip = scopedIP
+				zone = host[zoneIndex+1:]
+			}
+		}
+		if ip == nil {
+			ip = net.ParseIP(host)
+		}
+		if ip == nil {
+			if resolver == nil {
+				log.Error().Int(management.EventTypeKey, int(management.Cloudflared)).
+					Str(logFieldAddress, addr).Msg("edge discovery: injected DNS resolver is required")
+				continue
+			}
+			ips, err := resolver.LookupIP(context.Background(), host)
+			if err != nil {
+				log.Error().Int(management.EventTypeKey, int(management.Cloudflared)).
+					Str(logFieldAddress, addr).Err(err).Msg("edge discovery: injected DNS resolver failed to resolve edge hostname")
+				continue
+			}
+			if len(ips) == 0 || ips[0] == nil {
+				log.Error().Int(management.EventTypeKey, int(management.Cloudflared)).
+					Str(logFieldAddress, addr).Msg("edge discovery: injected DNS resolver returned no IP addresses for edge hostname")
+				continue
+			}
+			ip = ips[0]
+		}
+		version := V6
+		if ip.To4() != nil {
+			version = V4
+		}
+		resolved = append(resolved, &EdgeAddr{
+			TCP:       &net.TCPAddr{IP: ip, Port: port, Zone: zone},
+			UDP:       &net.UDPAddr{IP: ip, Port: port, Zone: zone},
+			IPVersion: version,
+		})
+	}
+	return
 }
 
 func lookupSRVWithDOT(srvService string, srvProto string, srvName string) (cname string, addrs []*net.SRV, err error) {

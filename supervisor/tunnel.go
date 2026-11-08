@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -39,6 +40,11 @@ const (
 	dialTimeout = 15 * time.Second
 )
 
+// DNSProxyResolver exchanges wire-format DNS messages using DoH.
+type DNSProxyResolver interface {
+	Exchange(ctx context.Context, message []byte) ([]byte, error)
+}
+
 type TunnelConfig struct {
 	ClientConfig       *client.Config
 	GracePeriod        time.Duration
@@ -46,6 +52,10 @@ type TunnelConfig struct {
 	EdgeAddrs          []string
 	Region             string
 	EdgeIPVersion      allregions.ConfigIPVersion
+	EdgeDNSResolver    allregions.DNSResolver
+	EgressProxyURL     *url.URL
+	DNSProxyIP         net.IP
+	DNSProxyResolver   DNSProxyResolver
 	EdgeBindAddr       net.IP
 	HAConnections      int
 	IsAutoupdated      bool
@@ -105,7 +115,7 @@ func StartTunnelDaemon(
 	connectedSignal *signal.Signal,
 	graceShutdownC <-chan struct{},
 ) error {
-	s, err := NewSupervisor(config, orchestrator, graceShutdownC)
+	s, err := newSupervisor(ctx, config, orchestrator, graceShutdownC)
 	if err != nil {
 		return err
 	}
@@ -504,7 +514,12 @@ func (e *EdgeTunnelServer) serveConnection(
 
 		connLog.Logger().Info().Msgf("Tunnel connection curve preferences: %v", tlsConfig.CurvePreferences)
 
-		edgeConn, err := edgediscovery.DialEdge(ctx, dialTimeout, tlsConfig, addr.TCP, e.edgeBindAddr)
+		var edgeConn net.Conn
+		if e.config.EgressProxyURL != nil {
+			edgeConn, err = edgediscovery.DialEdgeViaProxy(ctx, dialTimeout, tlsConfig, addr.TCP, e.edgeBindAddr, e.config.EgressProxyURL)
+		} else {
+			edgeConn, err = edgediscovery.DialEdge(ctx, dialTimeout, tlsConfig, addr.TCP, e.edgeBindAddr)
+		}
 		if err != nil {
 			// Parent cancellation is shutdown, not an edge connectivity failure.
 			// The caller will observe ctx.Err and stop without applying retry policy.

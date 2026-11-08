@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"net/url"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -55,6 +56,7 @@ const (
 	detailsAPIConnectionFailed       = "API Connection failed"
 	detailsApiReachable              = "API is reachable"
 	detailsDNSPrerequisiteFailed     = "DNS prerequisite failed"
+	detailsQUICSkippedByPolicy       = "QUIC probe skipped because HTTP/2-only mode is enabled"
 	detailsTLSConfigFailed           = "TLS configuration failed"
 
 	// Region hostname templates.
@@ -69,14 +71,21 @@ const (
 // EdgeDNSResolver implements DNSResolver for the standard DNS-based edge
 // discovery path.
 type EdgeDNSResolver struct {
-	Log *zerolog.Logger
+	Log      *zerolog.Logger
+	Resolver allregions.DNSResolver
 }
 
 func (r *EdgeDNSResolver) Resolve(region string) ([][]*allregions.EdgeAddr, error) {
-	return allregions.EdgeDiscovery(r.Log, allregions.RegionalServiceName(region))
+	service := allregions.RegionalServiceName(region)
+	if r.Resolver != nil {
+		return allregions.EdgeDiscoveryWithResolver(r.Log, service, r.Resolver)
+	}
+	return allregions.EdgeDiscovery(r.Log, service)
 }
 
-type EdgeTCPDialer struct{}
+type EdgeTCPDialer struct {
+	ProxyURL *url.URL
+}
 
 func (d *EdgeTCPDialer) DialEdge(
 	ctx context.Context,
@@ -85,6 +94,9 @@ func (d *EdgeTCPDialer) DialEdge(
 	addr *net.TCPAddr,
 	localIP net.IP,
 ) (net.Conn, error) {
+	if d.ProxyURL != nil {
+		return edgedial.DialEdgeViaProxy(ctx, timeout, tlsConfig, addr, localIP, d.ProxyURL)
+	}
 	return edgedial.DialEdge(ctx, timeout, tlsConfig, addr, localIP)
 }
 
@@ -367,9 +379,18 @@ func runDNSProbe(ctx context.Context, resolver DNSResolver, region string) []Res
 // ResolvedTarget per addr. Unresolvable addrs produce a Fail ResolvedTarget
 // with nil Addrs so the report shows which addresses could not be reached.
 func resolveStaticEdge(addrs []string, log *zerolog.Logger) []ResolvedTarget {
+	return resolveStaticEdgeWithResolver(addrs, log, nil)
+}
+
+func resolveStaticEdgeWithResolver(addrs []string, log *zerolog.Logger, resolver allregions.DNSResolver) []ResolvedTarget {
 	targets := make([]ResolvedTarget, 0, len(addrs))
 	for _, addr := range addrs {
-		resolved := allregions.ResolveAddrs([]string{addr}, log)
+		var resolved []*allregions.EdgeAddr
+		if resolver == nil {
+			resolved = allregions.ResolveAddrs([]string{addr}, log)
+		} else {
+			resolved = allregions.ResolveAddrsWithResolver([]string{addr}, log, resolver)
+		}
 		if len(resolved) > 0 {
 			targets = append(targets, ResolvedTarget{
 				Addrs:     resolved,

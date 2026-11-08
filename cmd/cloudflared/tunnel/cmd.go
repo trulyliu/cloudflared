@@ -22,6 +22,7 @@ import (
 
 	"github.com/cloudflare/cloudflared/cfapi"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/dnsproxy"
 	cfdflags "github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/proxydns"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/updater"
@@ -30,6 +31,7 @@ import (
 	"github.com/cloudflare/cloudflared/credentials"
 	"github.com/cloudflare/cloudflared/diagnostic"
 	"github.com/cloudflare/cloudflared/edgediscovery"
+	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 	"github.com/cloudflare/cloudflared/ingress"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/management"
@@ -391,15 +393,6 @@ func StartServer(
 		go writePidFile(connectedSignal, c.String("pidfile"), log)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		autoupdater := updater.NewAutoUpdater(
-			c.Bool(cfdflags.NoAutoUpdate), c.Duration(cfdflags.AutoUpdateFreq), &listeners, log,
-		)
-		errC <- autoupdater.Run(ctx)
-	}()
-
 	if namedTunnel == nil {
 		return fmt.Errorf("namedTunnel is nil")
 	}
@@ -417,6 +410,30 @@ func StartServer(
 		log.Err(err).Msg("Couldn't start tunnel")
 		return err
 	}
+	var dnsProxyServer *dnsproxy.Server
+	if tunnelConfig.DNSProxyIP != nil {
+		dnsProxyServer, err = dnsproxy.Listen(tunnelConfig.DNSProxyIP, 53, tunnelConfig.DNSProxyResolver, log)
+		if err != nil {
+			return fmt.Errorf("start local DNS proxy: %w", err)
+		}
+		defer func() { _ = dnsProxyServer.Close() }()
+		log.Info().IPAddr("address", tunnelConfig.DNSProxyIP).Int("port", 53).Msg("Local DNS proxy started")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := dnsProxyServer.Serve(ctx); err != nil && ctx.Err() == nil {
+				errC <- fmt.Errorf("local DNS proxy failed: %w", err)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		autoupdater := updater.NewAutoUpdater(
+			c.Bool(cfdflags.NoAutoUpdate), c.Duration(cfdflags.AutoUpdateFreq), &listeners, log,
+		)
+		errC <- autoupdater.Run(ctx)
+	}()
 	connectorID := tunnelConfig.ClientConfig.ConnectorID
 	precheckReports := diagnostic.NewPrecheckReportStore()
 
@@ -436,8 +453,15 @@ func StartServer(
 	}
 
 	serviceIP := c.String("service-op-ip")
-	if edgeAddrs, err := edgediscovery.ResolveEdge(log, tunnelConfig.Region, tunnelConfig.EdgeIPVersion); err == nil {
-		if serviceAddr, err := edgeAddrs.GetAddrForRPC(); err == nil {
+	var managementEdge *edgediscovery.Edge
+	var edgeLookupErr error
+	if tunnelConfig.EdgeDNSResolver != nil {
+		managementEdge, edgeLookupErr = edgediscovery.ResolveEdgeWithResolver(log, tunnelConfig.Region, tunnelConfig.EdgeIPVersion, allregions.ContextualResolver(ctx, tunnelConfig.EdgeDNSResolver))
+	} else {
+		managementEdge, edgeLookupErr = edgediscovery.ResolveEdge(log, tunnelConfig.Region, tunnelConfig.EdgeIPVersion)
+	}
+	if edgeLookupErr == nil {
+		if serviceAddr, err := managementEdge.GetAddrForRPC(); err == nil {
 			serviceIP = serviceAddr.TCP.String()
 		}
 	}
@@ -540,12 +564,14 @@ func runPrechecks(c *cli.Context, log *zerolog.Logger, tunnelConfig *supervisor.
 		EdgeBindAddr:     tunnelConfig.EdgeBindAddr,
 		QUICConfig:       tunnelConfig.QUICConfigOptions(),
 		EdgeAddrs:        tunnelConfig.EdgeAddrs,
-		ProtocolOverride: c.String(cfdflags.Protocol),
+		HTTP2Only:        tunnelConfig.EgressProxyURL != nil,
+		EdgeResolver:     tunnelConfig.EdgeDNSResolver,
+		ProtocolOverride: effectiveTunnelProtocol(c.String(cfdflags.Protocol), tunnelConfig.EgressProxyURL != nil),
 	}
 
 	dialers := prechecks.RunDialers{
-		DNSResolver:      &prechecks.EdgeDNSResolver{Log: log},
-		TCPDialer:        &prechecks.EdgeTCPDialer{},
+		DNSResolver:      &prechecks.EdgeDNSResolver{Log: log, Resolver: tunnelConfig.EdgeDNSResolver},
+		TCPDialer:        &prechecks.EdgeTCPDialer{ProxyURL: tunnelConfig.EgressProxyURL},
 		QUICDialer:       &prechecks.EdgeQUICDialer{},
 		ManagementDialer: &prechecks.NetManagementDialer{Dialer: net.Dialer{}},
 	}
@@ -656,6 +682,7 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 	flags := configureCloudflaredFlags(shouldHide)
 	flags = append(flags, configureProxyFlags(shouldHide)...)
 	flags = append(flags, cliutil.ConfigureLoggingFlags(shouldHide)...)
+	flags = append(flags, configureDNSProxyFlag(shouldHide))
 	flags = append(flags, proxydns.ConfigureProxyDNSFlags(shouldHide)...) // removed feature, only kept to not break any script that might be setting these flags
 	flags = append(flags, []cli.Flag{
 		credentialsFileFlag,
@@ -1095,6 +1122,14 @@ func configureProxyFlags(shouldHide bool) []cli.Flag {
 		}),
 	}
 	return append(flags, sshFlags(shouldHide)...)
+}
+
+func configureDNSProxyFlag(shouldHide bool) cli.Flag {
+	return altsrc.NewStringFlag(&cli.StringFlag{
+		Name:   cfdflags.DNSProxy,
+		Usage:  "Start a local UDP DNS-over-HTTPS proxy; optional loopback IP (default 127.0.0.1)",
+		Hidden: shouldHide,
+	})
 }
 
 func legacyTunnelFlag(msg string) string {

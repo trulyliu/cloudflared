@@ -11,6 +11,7 @@ import (
 
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/edgediscovery"
+	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 	"github.com/cloudflare/cloudflared/orchestration"
 	v3 "github.com/cloudflare/cloudflared/quic/v3"
 	"github.com/cloudflare/cloudflared/retry"
@@ -52,13 +53,29 @@ type tunnelError struct {
 	err   error
 }
 
+// NewSupervisor constructs a supervisor using a background context for edge discovery.
+// StartTunnelDaemon uses the daemon context when initializing a supervisor.
 func NewSupervisor(config *TunnelConfig, orchestrator *orchestration.Orchestrator, gracefulShutdownC <-chan struct{}) (*Supervisor, error) {
+	return newSupervisor(context.Background(), config, orchestrator, gracefulShutdownC)
+}
+
+func newSupervisor(ctx context.Context, config *TunnelConfig, orchestrator *orchestration.Orchestrator, gracefulShutdownC <-chan struct{}) (*Supervisor, error) {
 	isStaticEdge := len(config.EdgeAddrs) > 0
+	edgeResolver := config.EdgeDNSResolver
+	if edgeResolver != nil {
+		edgeResolver = allregions.ContextualResolver(ctx, edgeResolver)
+	}
 
 	var err error
 	var edgeIPs *edgediscovery.Edge
-	if isStaticEdge { // static edge addresses
-		edgeIPs, err = edgediscovery.StaticEdge(config.Log, config.EdgeAddrs)
+	if isStaticEdge {
+		if edgeResolver != nil {
+			edgeIPs, err = edgediscovery.StaticEdgeWithResolver(config.Log, config.EdgeAddrs, edgeResolver)
+		} else {
+			edgeIPs, err = edgediscovery.StaticEdge(config.Log, config.EdgeAddrs)
+		}
+	} else if edgeResolver != nil {
+		edgeIPs, err = edgediscovery.ResolveEdgeWithResolver(config.Log, config.Region, config.EdgeIPVersion, edgeResolver)
 	} else {
 		edgeIPs, err = edgediscovery.ResolveEdge(config.Log, config.Region, config.EdgeIPVersion)
 	}

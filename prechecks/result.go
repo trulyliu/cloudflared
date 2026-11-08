@@ -107,13 +107,15 @@ func summaryLine(r Report) string {
 
 // hasHardFail returns true when the environment cannot establish a tunnel:
 //   - Any DNS probe failed, OR
-//   - Both the QUIC and HTTP/2 transport probes failed.
-//
-// A single transport failing is not a hard fail — the other transport can be
-// used as a fallback (degraded state, reported via hasWarn).
+//   - Both transports failed, OR
+//   - HTTP/2 failed while QUIC was skipped and therefore unavailable.
 func (r Report) hasHardFail() bool {
-	var quicFail, http2Fail bool
+	var quicFail, quicSkipped, quicPassed, http2Fail bool
 	for _, res := range r.Results {
+		if res.Type == ProbeTypeQUIC {
+			quicSkipped = quicSkipped || res.ProbeStatus == Skip
+			quicPassed = quicPassed || res.ProbeStatus == Pass
+		}
 		if res.ProbeStatus != Fail {
 			continue
 		}
@@ -128,7 +130,7 @@ func (r Report) hasHardFail() bool {
 			// Management API failure is not a hard fail
 		}
 	}
-	return quicFail && http2Fail
+	return http2Fail && (quicFail || (quicSkipped && !quicPassed))
 }
 
 // HasHardFail reports whether the environment cannot establish a tunnel.

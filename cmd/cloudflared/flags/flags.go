@@ -4,6 +4,12 @@ const (
 	// HaConnections specifies how many connections to make to the edge
 	HaConnections = "ha-connections"
 
+	// DNSProxy enables the local UDP DNS-over-HTTPS proxy.
+	DNSProxy = "dns-proxy"
+
+	// DNSProxyDefaultAddress is the default loopback address for DNSProxy.
+	DNSProxyDefaultAddress = "127.0.0.1"
+
 	// SshPort is the port on localhost the cloudflared ssh server will run on
 	SshPort = "local-ssh-port"
 

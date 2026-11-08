@@ -16,6 +16,7 @@ const (
 
 var errNoAddressesLeft = ErrNoAddressesLeft{}
 
+//nolint:errname // Public type name predates this convention; renaming it would break callers.
 type ErrNoAddressesLeft struct{}
 
 func (e ErrNoAddressesLeft) Error() string {
@@ -46,6 +47,15 @@ func ResolveEdge(log *zerolog.Logger, region string, edgeIpVersion allregions.Co
 	}, nil
 }
 
+// ResolveEdgeWithResolver discovers edge addresses using only the supplied DNS resolver.
+func ResolveEdgeWithResolver(log *zerolog.Logger, region string, edgeIPVersion allregions.ConfigIPVersion, resolver allregions.DNSResolver) (*Edge, error) {
+	regions, err := allregions.ResolveEdgeWithResolver(log, region, edgeIPVersion, resolver)
+	if err != nil {
+		return new(Edge), err
+	}
+	return &Edge{log: log, regions: regions}, nil
+}
+
 // StaticEdge creates a list of edge addresses from the list of hostnames. Mainly used for testing connectivity.
 func StaticEdge(log *zerolog.Logger, hostnames []string) (*Edge, error) {
 	regions, err := allregions.StaticEdge(hostnames, log)
@@ -56,6 +66,15 @@ func StaticEdge(log *zerolog.Logger, hostnames []string) (*Edge, error) {
 		log:     log,
 		regions: regions,
 	}, nil
+}
+
+// StaticEdgeWithResolver resolves custom edge addresses using only the supplied resolver.
+func StaticEdgeWithResolver(log *zerolog.Logger, hostnames []string, resolver allregions.DNSResolver) (*Edge, error) {
+	regions, err := allregions.StaticEdgeWithResolver(hostnames, log, resolver)
+	if err != nil {
+		return new(Edge), err
+	}
+	return &Edge{log: log, regions: regions}, nil
 }
 
 // ------------------------------------

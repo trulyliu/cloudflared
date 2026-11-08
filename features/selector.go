@@ -35,6 +35,16 @@ func NewFeatureSelector(ctx context.Context, accountTag string, cliFeatures []st
 	return newFeatureSelector(ctx, accountTag, logger, newDNSResolver(), cliFeatures, pq, defaultLookupFreq)
 }
 
+// TXTLookup resolves TXT records for the feature selector.
+type TXTLookup interface {
+	LookupTXT(ctx context.Context, host string) ([]string, error)
+}
+
+// NewFeatureSelectorWithResolver creates a feature selector using the supplied TXT resolver.
+func NewFeatureSelectorWithResolver(ctx context.Context, accountTag string, cliFeatures []string, pq bool, logger *zerolog.Logger, resolver TXTLookup) (FeatureSelector, error) {
+	return newFeatureSelector(ctx, accountTag, logger, txtResolver{resolver: resolver}, cliFeatures, pq, defaultLookupFreq)
+}
+
 type FeatureSelector interface {
 	Snapshot() FeatureSnapshot
 }
@@ -71,15 +81,10 @@ func newFeatureSelector(ctx context.Context, accountTag string, logger *zerolog.
 		staticFeatures: staticFeatures,
 		cliFeatures:    dedupAndRemoveFeatures(cliFeatures),
 	}
-
-	// Load the remote features
 	if err := selector.refresh(ctx); err != nil {
 		logger.Err(err).Msg("Failed to fetch features, default to disable")
 	}
-
-	// Spin off reloading routine
 	go selector.refreshLoop(ctx, refreshFreq)
-
 	return selector, nil
 }
 
@@ -176,6 +181,24 @@ func (fs *featureSelector) refreshLoop(ctx context.Context, refreshFreq time.Dur
 // resolver represents an object that can look up featuresRecord
 type resolver interface {
 	lookupRecord(ctx context.Context) ([]byte, error)
+}
+
+type txtResolver struct {
+	resolver TXTLookup
+}
+
+func (tr txtResolver) lookupRecord(ctx context.Context) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, lookupTimeout)
+	defer cancel()
+
+	records, err := tr.resolver.LookupTXT(ctx, featureSelectorHostname)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("no TXT record found for %s to determine which features to opt-in", featureSelectorHostname)
+	}
+	return []byte(records[0]), nil
 }
 
 type dnsResolver struct {

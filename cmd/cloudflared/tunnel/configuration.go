@@ -22,6 +22,7 @@ import (
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
+	"github.com/cloudflare/cloudflared/doh"
 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 	"github.com/cloudflare/cloudflared/features"
 	"github.com/cloudflare/cloudflared/ingress"
@@ -104,6 +105,9 @@ func isSecretFlag(key string) bool {
 }
 
 func isSecretEnvVar(key string) bool {
+	if key == sandEgressProxyEnv {
+		return true
+	}
 	for _, flag := range secretEnvFlags {
 		for _, secretEnvVar := range flag.EnvVars {
 			if secretEnvVar == key {
@@ -114,6 +118,30 @@ func isSecretEnvVar(key string) bool {
 	return false
 }
 
+func parseDNSProxyIP(enabled bool, address string) (net.IP, error) {
+	if !enabled {
+		return nil, nil
+	}
+	if address == "" {
+		address = flags.DNSProxyDefaultAddress
+	}
+	if len(address) > 2 && address[0] == '[' && address[len(address)-1] == ']' {
+		address = address[1 : len(address)-1]
+	}
+	ip := net.ParseIP(address)
+	if ip == nil || !ip.IsLoopback() {
+		return nil, fmt.Errorf("--%s must specify a loopback IP address", flags.DNSProxy)
+	}
+	return ip, nil
+}
+
+func effectiveTunnelProtocol(configured string, sandEgressEnabled bool) string {
+	if sandEgressEnabled {
+		return connection.HTTP2.String()
+	}
+	return configured
+}
+
 func prepareTunnelConfig(
 	ctx context.Context,
 	c *cli.Context,
@@ -122,11 +150,49 @@ func prepareTunnelConfig(
 	observer *connection.Observer,
 	namedTunnel *connection.TunnelProperties,
 ) (*supervisor.TunnelConfig, *orchestration.Config, error) {
-	transportProtocol := c.String(flags.Protocol)
-	isPostQuantumEnforced := c.Bool(flags.PostQuantum)
-	featureSelector, err := features.NewFeatureSelector(ctx, namedTunnel.Credentials.AccountTag, c.StringSlice(flags.Features), isPostQuantumEnforced, log)
+	sandEgressEnabled, egressProxyURL, err := sandEgressProxyFromEnv(os.Getenv)
+	if err != nil {
+		return nil, nil, err
+	}
+	dnsProxyIP, err := parseDNSProxyIP(c.IsSet(flags.DNSProxy), c.String(flags.DNSProxy))
+	if err != nil {
+		return nil, nil, err
+	}
+	transportProtocol := effectiveTunnelProtocol(c.String(flags.Protocol), sandEgressEnabled)
+	var edgeDNSResolver allregions.DNSResolver
+	var dohResolver *doh.Resolver
+	var featureSelector features.FeatureSelector
+	if sandEgressEnabled {
+		dohResolver, resolverErr := doh.NewResolver(egressProxyURL)
+		if resolverErr != nil {
+			return nil, nil, fmt.Errorf("failed to create SAND DNS-over-HTTPS resolver: %w", resolverErr)
+		}
+		edgeDNSResolver = dohResolver
+		featureSelector, err = features.NewFeatureSelectorWithResolver(ctx, namedTunnel.Credentials.AccountTag, c.StringSlice(flags.Features), c.Bool(flags.PostQuantum), log, dohResolver)
+	} else {
+		featureSelector, err = features.NewFeatureSelector(ctx, namedTunnel.Credentials.AccountTag, c.StringSlice(flags.Features), c.Bool(flags.PostQuantum), log)
+	}
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "Failed to create feature selector")
+	}
+	var dnsProxyResolver supervisor.DNSProxyResolver
+	if dnsProxyIP != nil {
+		if dohResolver == nil {
+			proxyURL, proxyErr := sandEgressProxyURLFromEnv(os.Getenv)
+			if proxyErr != nil {
+				return nil, nil, proxyErr
+			}
+			var resolverErr error
+			if proxyURL != nil {
+				dohResolver, resolverErr = doh.NewResolver(proxyURL)
+			} else {
+				dohResolver, resolverErr = doh.NewDirectResolver()
+			}
+			if resolverErr != nil {
+				return nil, nil, fmt.Errorf("failed to create DNS proxy DoH resolver: %w", resolverErr)
+			}
+		}
+		dnsProxyResolver = dohResolver
 	}
 
 	clientConfig, err := client.NewConfig(info.Version(), info.OSArch(), featureSelector)
@@ -228,19 +294,23 @@ func prepareTunnelConfig(
 	originDialerService.AddReservedService(dnsService, []netip.AddrPort{origins.VirtualDNSServiceAddr})
 
 	tunnelConfig := &supervisor.TunnelConfig{
-		ClientConfig:    clientConfig,
-		GracePeriod:     gracePeriod,
-		EdgeAddrs:       c.StringSlice(flags.Edge),
-		Region:          resolvedRegion,
-		EdgeIPVersion:   edgeIPVersion,
-		EdgeBindAddr:    edgeBindAddr,
-		HAConnections:   c.Int(flags.HaConnections),
-		IsAutoupdated:   c.Bool(flags.IsAutoUpdated),
-		LBPool:          c.String(flags.LBPool),
-		Tags:            tags,
-		Log:             log,
-		Observer:        observer,
-		ReportedVersion: info.Version(),
+		EdgeDNSResolver:  edgeDNSResolver,
+		EgressProxyURL:   egressProxyURL,
+		DNSProxyIP:       dnsProxyIP,
+		DNSProxyResolver: dnsProxyResolver,
+		ClientConfig:     clientConfig,
+		GracePeriod:      gracePeriod,
+		EdgeAddrs:        c.StringSlice(flags.Edge),
+		Region:           resolvedRegion,
+		EdgeIPVersion:    edgeIPVersion,
+		EdgeBindAddr:     edgeBindAddr,
+		HAConnections:    c.Int(flags.HaConnections),
+		IsAutoupdated:    c.Bool(flags.IsAutoUpdated),
+		LBPool:           c.String(flags.LBPool),
+		Tags:             tags,
+		Log:              log,
+		Observer:         observer,
+		ReportedVersion:  info.Version(),
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
 		Retries:                             uint(c.Int(flags.Retries)), // nolint: gosec
 		RunFromTerminal:                     isRunningFromTerminal(),

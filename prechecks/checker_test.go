@@ -1,9 +1,13 @@
 package prechecks
 
 import (
+	"context"
 	"errors"
 	"math"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -92,6 +96,181 @@ func newFakeQUICConn(ctrl *gomock.Controller) *mocks.MockQUICConnection {
 	conn := mocks.NewMockQUICConnection(ctrl)
 	conn.EXPECT().CloseWithError(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	return conn
+}
+
+type precheckInjectedDNSResolver struct {
+	srvRecords []*net.SRV
+	ipsByHost  map[string][]net.IP
+	srvQueries []string
+	ipQueries  []string
+}
+
+func (r *precheckInjectedDNSResolver) LookupSRV(_ context.Context, service, proto, name string) (string, []*net.SRV, error) {
+	r.srvQueries = append(r.srvQueries, service+"/"+proto+"/"+name)
+	return "", r.srvRecords, nil
+}
+
+func (r *precheckInjectedDNSResolver) LookupIP(_ context.Context, host string) ([]net.IP, error) {
+	r.ipQueries = append(r.ipQueries, host)
+	return r.ipsByHost[host], nil
+}
+
+type blockingPrecheckDNSResolver struct {
+	started  chan string
+	canceled chan error
+}
+
+func (r *blockingPrecheckDNSResolver) LookupSRV(ctx context.Context, _, _, _ string) (string, []*net.SRV, error) {
+	return "", nil, r.wait(ctx, "srv")
+}
+
+func (r *blockingPrecheckDNSResolver) LookupIP(ctx context.Context, _ string) ([]net.IP, error) {
+	return nil, r.wait(ctx, "ip")
+}
+
+func (r *blockingPrecheckDNSResolver) wait(ctx context.Context, operation string) error {
+	r.started <- operation
+	select {
+	case <-ctx.Done():
+		r.canceled <- ctx.Err()
+		return ctx.Err()
+	case <-time.After(2 * time.Second):
+		err := errors.New("resolver context was not canceled")
+		r.canceled <- err
+		return err
+	}
+}
+
+func TestRunPropagatesCancellationToInjectedDNSResolver(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name      string
+		edgeAddrs []string
+		wantCall  string
+	}{
+		{name: "dynamic", wantCall: "srv"},
+		{name: "static", edgeAddrs: []string{"edge.example:7844"}, wantCall: "ip"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			resolver := &blockingPrecheckDNSResolver{started: make(chan string, 1), canceled: make(chan error, 1)}
+			management := mocks.NewMockManagementDialer(gomock.NewController(t))
+			management.EXPECT().DialContext(gomock.Any(), "tcp", targetAPI).Return(nopConn{}, nil)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			reportC := make(chan Report, 1)
+			go func() {
+				reportC <- Run(ctx, emptyCert, Config{
+					Timeout: 5 * time.Second, IPVersion: allregions.IPv4Only,
+					EdgeAddrs: test.edgeAddrs, EdgeResolver: resolver,
+				}, features.PostQuantumPrefer, nopLogger(), RunDialers{ManagementDialer: management})
+			}()
+			select {
+			case call := <-resolver.started:
+				require.Equal(t, test.wantCall, call)
+			case <-time.After(time.Second):
+				t.Fatal("injected resolver was not called")
+			}
+			cancel()
+			select {
+			case <-reportC:
+			case <-time.After(time.Second):
+				t.Fatal("prechecks did not stop after resolver cancellation")
+			}
+			require.ErrorIs(t, <-resolver.canceled, context.Canceled)
+		})
+	}
+}
+
+func TestRunHTTP2OnlyUsesInjectedDynamicResolver(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	dns := &precheckInjectedDNSResolver{
+		srvRecords: []*net.SRV{{Target: "region1.example", Port: 7844}, {Target: "region2.example", Port: 7844}},
+		ipsByHost: map[string][]net.IP{
+			"region1.example": {net.ParseIP("192.0.2.1")},
+			"region2.example": {net.ParseIP("192.0.2.2")},
+		},
+	}
+	tcp := mocks.NewMockTCPDialer(ctrl)
+	tcp.EXPECT().DialEdge(gomock.Any(), perProbeDialTimeout, gomock.Any(), gomock.Any(), nil).Return(nopConn{}, nil).Times(2)
+	quic := mocks.NewMockQUICDialer(ctrl)
+	management := mocks.NewMockManagementDialer(ctrl)
+	management.EXPECT().DialContext(gomock.Any(), "tcp", targetAPI).Return(nopConn{}, nil)
+
+	report := Run(t.Context(), emptyCert, Config{
+		Timeout: 2 * time.Second, IPVersion: allregions.IPv4Only, HTTP2Only: true,
+		EdgeResolver: dns, ProtocolOverride: connection.HTTP2.String(),
+	}, features.PostQuantumPrefer, nopLogger(), RunDialers{
+		TCPDialer: tcp, QUICDialer: quic, ManagementDialer: management,
+	})
+	requireStatuses(t, report, Pass, Pass, Skip, Skip, Pass, Pass, Pass)
+	assert.Equal(t, []string{"v2-origintunneld/tcp/argotunnel.com"}, dns.srvQueries)
+	assert.Equal(t, []string{"region1.example", "region2.example"}, dns.ipQueries)
+	require.NotNil(t, report.SuggestedProtocol)
+	assert.Equal(t, connection.HTTP2, *report.SuggestedProtocol)
+	assert.Equal(t, detailsQUICSkippedByPolicy, report.Results[2].Details)
+}
+
+func TestRunHTTP2OnlyStaticEdgeUsesInjectedResolver(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	dns := &precheckInjectedDNSResolver{ipsByHost: map[string][]net.IP{
+		"explicit-edge.example": {net.ParseIP("192.0.2.3")},
+	}}
+	tcp := mocks.NewMockTCPDialer(ctrl)
+	tcp.EXPECT().DialEdge(gomock.Any(), perProbeDialTimeout, gomock.Any(), &net.TCPAddr{IP: net.ParseIP("192.0.2.3"), Port: 7844}, nil).
+		Return(nopConn{}, nil)
+	quic := mocks.NewMockQUICDialer(ctrl)
+	management := mocks.NewMockManagementDialer(ctrl)
+	management.EXPECT().DialContext(gomock.Any(), "tcp", targetAPI).Return(nopConn{}, nil)
+
+	report := Run(t.Context(), emptyCert, Config{
+		Timeout: 2 * time.Second, IPVersion: allregions.IPv4Only, HTTP2Only: true,
+		EdgeAddrs: []string{"explicit-edge.example:7844"}, EdgeResolver: dns,
+		ProtocolOverride: connection.HTTP2.String(),
+	}, features.PostQuantumPrefer, nopLogger(), RunDialers{
+		TCPDialer: tcp, QUICDialer: quic, ManagementDialer: management,
+	})
+	requireStatuses(t, report, Pass, Skip, Pass, Pass)
+	assert.Empty(t, dns.srvQueries)
+	assert.Equal(t, []string{"explicit-edge.example"}, dns.ipQueries)
+}
+
+func TestRunHTTP2OnlyProbesThroughProxyAndNeverCallsQUIC(t *testing.T) {
+	t.Parallel()
+	connectTargets := make(chan string, 4)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodConnect {
+			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		connectTargets <- request.Host
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse("http://" + proxy.Listener.Addr().String())
+	require.NoError(t, err)
+
+	ctrl := gomock.NewController(t)
+	quic := mocks.NewMockQUICDialer(ctrl)
+	management := mocks.NewMockManagementDialer(ctrl)
+	management.EXPECT().DialContext(gomock.Any(), "tcp", targetAPI).Return(nopConn{}, nil)
+	report := Run(t.Context(), emptyCert, Config{
+		Timeout: 500 * time.Millisecond, IPVersion: allregions.IPv4Only, HTTP2Only: true,
+		EdgeAddrs: []string{"127.0.0.1:7844"}, ProtocolOverride: connection.HTTP2.String(),
+	}, features.PostQuantumPrefer, nopLogger(), RunDialers{
+		TCPDialer: &EdgeTCPDialer{ProxyURL: proxyURL}, QUICDialer: quic, ManagementDialer: management,
+	})
+	requireStatuses(t, report, Pass, Skip, Fail, Pass)
+	assert.Equal(t, detailsQUICSkippedByPolicy, report.Results[1].Details)
+	assert.True(t, report.hasHardFail())
+	select {
+	case target := <-connectTargets:
+		assert.Equal(t, "127.0.0.1:7844", target)
+	default:
+		t.Fatal("HTTP/2 precheck did not send CONNECT through the configured proxy")
+	}
 }
 
 // ---------------------------------------------------------------------------
